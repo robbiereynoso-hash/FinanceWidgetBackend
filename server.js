@@ -114,8 +114,12 @@ app.post('/api/sync_investments', async (req, res) => {
       holdingsByAccount[h.account_id].push(enriched);
     }
 
-    // Build per-account totals + attach holdings list.
-    const accounts = (rawAccounts || []).map(a => {
+    // Filter to investment-type accounts only — Plaid returns ALL accounts on the
+    // Item (depository, credit, loan, etc.) but those belong on the Bank tab via
+    // /api/sync_account. Investments tab should only show actual brokerage / IRA /
+    // 401k / Roth / 529 / HSA-investment accounts.
+    const investmentAccounts = (rawAccounts || []).filter(a => a.type === 'investment');
+    const accounts = investmentAccounts.map(a => {
       const holdings = holdingsByAccount[a.account_id] || [];
       // Prefer Plaid's reported balance; fall back to summed holdings.
       const value = a.balances.current ?? holdings.reduce((sum, h) => sum + h.value, 0);
