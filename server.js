@@ -20,6 +20,10 @@ const plaidClient = new PlaidApi(plaidConfig);
 // `flow` is "bank" (default) or "investments". Two flows because most banks don't
 // support investments and most brokerages don't support transactions, so a single
 // link_token covering both wouldn't surface either.
+//
+// account_filters with account_selection_enabled lets the user pick WHICH sub-accounts
+// to share at Link time — a bank returning 7 accounts won't auto-bill us for all 7.
+// User self-selects what they actually want to track.
 app.post('/api/create_link_token', async (req, res) => {
   try {
     const flow = (req.body && req.body.flow) || 'bank';
@@ -30,9 +34,31 @@ app.post('/api/create_link_token', async (req, res) => {
       products,
       country_codes: ['US'],
       language: 'en',
+      // Surface Plaid's account-selection screen during Link.
+      account_filters: flow === 'investments'
+        ? { investment: { account_subtypes: ['all'] } }
+        : { depository: { account_subtypes: ['all'] } },
     });
     res.json({ link_token: response.data.link_token });
   } catch (err) {
+    console.error(err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Disconnect a Plaid Item. Calls /item/remove which halts billing for that Item's
+// accounts. Idempotent: returns success even if the item was already removed.
+app.post('/api/disconnect_item', async (req, res) => {
+  try {
+    const { access_token } = req.body;
+    await plaidClient.itemRemove({ access_token });
+    res.json({ removed: true });
+  } catch (err) {
+    // ITEM_NOT_FOUND / INVALID_ACCESS_TOKEN are fine — already gone or already invalid.
+    const code = err.response?.data?.error_code;
+    if (code === 'ITEM_NOT_FOUND' || code === 'INVALID_ACCESS_TOKEN') {
+      return res.json({ removed: true, note: code });
+    }
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
