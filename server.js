@@ -17,12 +17,17 @@ const plaidConfig = new Configuration({
 
 const plaidClient = new PlaidApi(plaidConfig);
 
+// `flow` is "bank" (default) or "investments". Two flows because most banks don't
+// support investments and most brokerages don't support transactions, so a single
+// link_token covering both wouldn't surface either.
 app.post('/api/create_link_token', async (req, res) => {
   try {
+    const flow = (req.body && req.body.flow) || 'bank';
+    const products = flow === 'investments' ? ['investments'] : ['transactions'];
     const response = await plaidClient.linkTokenCreate({
       user: { client_user_id: 'finance-widget-user' },
       client_name: 'Finance Widget',
-      products: ['transactions'],
+      products,
       country_codes: ['US'],
       language: 'en',
     });
@@ -44,8 +49,7 @@ app.post('/api/exchange_token', async (req, res) => {
   }
 });
 
-// Replaces /api/get_balance. Calls /transactions/sync (paginated until has_more=false),
-// returns balance (sum of depository), full accounts array, recent transactions, next_cursor.
+// Bank flow — paginated /transactions/sync, returns balance + accounts + recent transactions.
 app.post('/api/sync_account', async (req, res) => {
   try {
     const { access_token, cursor } = req.body;
@@ -77,7 +81,64 @@ app.post('/api/sync_account', async (req, res) => {
   }
 });
 
-// Scaffold for future credit re-enable. Not currently called by client.
+// Investments flow — /investments/holdings/get returns accounts, holdings, and securities.
+// Joins them client-side: each holding gets ticker/name/type from its security_id.
+// Returns: { totalValue, accounts: [{ accountId, name, mask, type, subtype, value, holdings: [...] }] }
+app.post('/api/sync_investments', async (req, res) => {
+  try {
+    const { access_token } = req.body;
+    const response = await plaidClient.investmentsHoldingsGet({ access_token });
+    const { accounts: rawAccounts, holdings: rawHoldings, securities } = response.data;
+
+    // Index securities by id for O(1) lookup.
+    const securityById = {};
+    for (const s of securities || []) securityById[s.security_id] = s;
+
+    // Group holdings by account_id, attaching security metadata.
+    const holdingsByAccount = {};
+    for (const h of rawHoldings || []) {
+      const sec = securityById[h.security_id] || {};
+      const enriched = {
+        account_id: h.account_id,
+        security_id: h.security_id,
+        ticker: sec.ticker_symbol || null,
+        name: sec.name || sec.ticker_symbol || 'Unknown',
+        type: sec.type || 'unknown',                       // equity, etf, mutual_fund, fixed_income, cryptocurrency, ...
+        quantity: h.quantity ?? 0,
+        currentPrice: h.institution_price ?? sec.close_price ?? 0,
+        value: h.institution_value ?? ((h.quantity ?? 0) * (h.institution_price ?? 0)),
+        costBasis: h.cost_basis ?? null,
+        currency: h.iso_currency_code || sec.iso_currency_code || 'USD',
+      };
+      if (!holdingsByAccount[h.account_id]) holdingsByAccount[h.account_id] = [];
+      holdingsByAccount[h.account_id].push(enriched);
+    }
+
+    // Build per-account totals + attach holdings list.
+    const accounts = (rawAccounts || []).map(a => {
+      const holdings = holdingsByAccount[a.account_id] || [];
+      // Prefer Plaid's reported balance; fall back to summed holdings.
+      const value = a.balances.current ?? holdings.reduce((sum, h) => sum + h.value, 0);
+      return {
+        account_id: a.account_id,
+        name: a.name,
+        mask: a.mask,
+        type: a.type,
+        subtype: a.subtype,
+        value,
+        holdings,
+      };
+    });
+
+    const totalValue = accounts.reduce((sum, a) => sum + (a.value || 0), 0);
+    res.json({ totalValue, accounts });
+  } catch (err) {
+    console.error(err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Scaffold for future credit re-enable. Not currently called.
 app.post('/api/get_credit', async (req, res) => {
   try {
     const { access_token } = req.body;
