@@ -5,6 +5,17 @@ const { PlaidApi, PlaidEnvironments, Configuration } = require('plaid');
 const app = express();
 app.use(express.json());
 
+// Apple App Site Association — served at /.well-known/apple-app-site-association
+// for Universal Links. Plaid OAuth bounces the user to PLAID_REDIRECT_URI after the
+// bank login, and iOS uses this file to deep-link the redirect back into the app.
+// appID embeds the real Apple Team ID (Y9SL7H6THQ).
+// Apple expects Content-Type application/json and NO file extension.
+const path = require('path');
+app.get('/.well-known/apple-app-site-association', (req, res) => {
+  res.type('application/json');
+  res.sendFile(path.join(__dirname, '.well-known', 'apple-app-site-association'));
+});
+
 const plaidConfig = new Configuration({
   basePath: PlaidEnvironments[process.env.PLAID_ENV || 'sandbox'],
   baseOptions: {
@@ -28,7 +39,14 @@ app.post('/api/create_link_token', async (req, res) => {
   try {
     const flow = (req.body && req.body.flow) || 'bank';
     const products = flow === 'investments' ? ['investments'] : ['transactions'];
-    const response = await plaidClient.linkTokenCreate({
+    // OAuth redirect URI — required for production OAuth banks (Chase, BoA, Wells, etc.).
+    // Stays opt-in via env var: don't include the field at all unless PLAID_REDIRECT_URI
+    // is set on Railway, otherwise sandbox calls fail with INVALID_FIELD because the URI
+    // hasn't been registered in the Plaid Dashboard yet. Flip it on by:
+    //   1. Adding the URI to Plaid Dashboard → Team Settings → API → Allowed redirect URIs
+    //   2. Setting PLAID_REDIRECT_URI on Railway to the same string
+    //   3. Hosting the AASA file (already wired) with real Apple Team ID
+    const linkParams = {
       user: { client_user_id: 'finance-widget-user' },
       client_name: 'Finance Widget',
       products,
@@ -38,7 +56,11 @@ app.post('/api/create_link_token', async (req, res) => {
       account_filters: flow === 'investments'
         ? { investment: { account_subtypes: ['all'] } }
         : { depository: { account_subtypes: ['all'] } },
-    });
+    };
+    if (process.env.PLAID_REDIRECT_URI) {
+      linkParams.redirect_uri = process.env.PLAID_REDIRECT_URI;
+    }
+    const response = await plaidClient.linkTokenCreate(linkParams);
     res.json({ link_token: response.data.link_token });
   } catch (err) {
     console.error(err.response?.data || err.message);
