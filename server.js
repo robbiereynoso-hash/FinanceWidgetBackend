@@ -51,12 +51,13 @@ app.post('/api/create_link_token', async (req, res) => {
     const flow = (req.body && req.body.flow) || 'bank';
     const products = flow === 'investments' ? ['investments'] : ['transactions'];
     // OAuth redirect URI — required for production OAuth banks (Chase, BoA, Wells, etc.).
-    // Stays opt-in via env var: don't include the field at all unless PLAID_REDIRECT_URI
-    // is set on Railway, otherwise sandbox calls fail with INVALID_FIELD because the URI
-    // hasn't been registered in the Plaid Dashboard yet. Flip it on by:
-    //   1. Adding the URI to Plaid Dashboard → Team Settings → API → Allowed redirect URIs
-    //   2. Setting PLAID_REDIRECT_URI on Railway to the same string
-    //   3. Hosting the AASA file (already wired) with real Apple Team ID
+    // Gated on BOTH PLAID_REDIRECT_URI being set AND PLAID_ENV being non-sandbox.
+    // Sandbox doesn't validate redirect URIs the same way and rejects link_token_create
+    // with HTTP 400 when redirect_uri is supplied unless the URI is registered for the
+    // sandbox env in Plaid Dashboard. The cleanest stance: only attach redirect_uri
+    // when we're actually in production (where OAuth banks need it). Sandbox stays
+    // OAuth-less, which is fine — sandbox's First Platypus Bank doesn't OAuth-redirect.
+    const env = process.env.PLAID_ENV || 'sandbox';
     const linkParams = {
       user: { client_user_id: 'finance-widget-user' },
       client_name: 'Finance Widget',
@@ -68,7 +69,7 @@ app.post('/api/create_link_token', async (req, res) => {
         ? { investment: { account_subtypes: ['all'] } }
         : { depository: { account_subtypes: ['all'] } },
     };
-    if (process.env.PLAID_REDIRECT_URI) {
+    if (process.env.PLAID_REDIRECT_URI && env !== 'sandbox') {
       linkParams.redirect_uri = process.env.PLAID_REDIRECT_URI;
     }
     const response = await plaidClient.linkTokenCreate(linkParams);
