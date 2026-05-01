@@ -7,13 +7,24 @@ app.use(express.json());
 
 // Apple App Site Association — served at /.well-known/apple-app-site-association
 // for Universal Links. Plaid OAuth bounces the user to PLAID_REDIRECT_URI after the
-// bank login, and iOS uses this file to deep-link the redirect back into the app.
+// bank login; iOS reads this file to deep-link the redirect back into the app.
 // appID embeds the real Apple Team ID (Y9SL7H6THQ).
-// Apple expects Content-Type application/json and NO file extension.
-const path = require('path');
+// Apple requires Content-Type application/json and no file extension.
+// Inlined as an object (instead of sendFile from .well-known/) because Railway's
+// Nixpacks builder excludes hidden directories from the deploy bundle.
+const APPLE_APP_SITE_ASSOCIATION = {
+  applinks: {
+    apps: [],
+    details: [
+      {
+        appID: 'Y9SL7H6THQ.com.Victorian.FinanceWidget',
+        paths: ['/oauth-redirect', '/oauth-redirect/*'],
+      },
+    ],
+  },
+};
 app.get('/.well-known/apple-app-site-association', (req, res) => {
-  res.type('application/json');
-  res.sendFile(path.join(__dirname, '.well-known', 'apple-app-site-association'));
+  res.type('application/json').send(APPLE_APP_SITE_ASSOCIATION);
 });
 
 const plaidConfig = new Configuration({
