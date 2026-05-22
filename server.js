@@ -27,12 +27,22 @@ app.get('/.well-known/apple-app-site-association', (req, res) => {
   res.type('application/json').send(APPLE_APP_SITE_ASSOCIATION);
 });
 
+// Pick the right Plaid secret based on PLAID_ENV. Production access requires a
+// separate secret from the sandbox one — both live as Railway env vars and we
+// switch by environment so the flip is a single env change rather than a code
+// change. Falls back to the sandbox secret if production isn't set yet, so the
+// backend stays bootable on first prod deploy if env vars haven't all landed.
+const plaidEnv = process.env.PLAID_ENV || 'sandbox';
+const plaidSecret = plaidEnv === 'production'
+  ? (process.env.PLAID_PRODUCTION_SECRET || process.env.PLAID_SANDBOX_SECRET)
+  : process.env.PLAID_SANDBOX_SECRET;
+
 const plaidConfig = new Configuration({
-  basePath: PlaidEnvironments[process.env.PLAID_ENV || 'sandbox'],
+  basePath: PlaidEnvironments[plaidEnv],
   baseOptions: {
     headers: {
       'PLAID-CLIENT-ID': process.env.PLAID_CLIENT_ID,
-      'PLAID-SECRET': process.env.PLAID_SANDBOX_SECRET,
+      'PLAID-SECRET': plaidSecret,
     },
   },
 });
