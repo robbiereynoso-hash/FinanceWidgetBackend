@@ -77,7 +77,10 @@ app.post('/api/create_link_token', async (req, res) => {
       // Surface Plaid's account-selection screen during Link.
       account_filters: flow === 'investments'
         ? { investment: { account_subtypes: ['all'] } }
-        : { depository: { account_subtypes: ['all'] } },
+        : {
+            depository: { account_subtypes: ['all'] },
+            credit: { account_subtypes: ['all'] },
+          },
     };
     if (process.env.PLAID_REDIRECT_URI && env !== 'sandbox') {
       linkParams.redirect_uri = process.env.PLAID_REDIRECT_URI;
