@@ -1,9 +1,116 @@
 require('dotenv').config();
 const express = require('express');
+const crypto = require('crypto');
+const http2 = require('http2');
 const { PlaidApi, PlaidEnvironments, Configuration } = require('plaid');
 
 const app = express();
 app.use(express.json());
+
+// Public base URL of this backend. Used to stamp webhook URLs onto Plaid Items
+// so Plaid knows where to ping us on new transaction / holding data. Fallback
+// is the Railway hostname so the backend keeps working without explicit env.
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://financewidgetbackend-production.up.railway.app';
+const WEBHOOK_URL = PUBLIC_BASE_URL + '/api/plaid_webhook';
+
+// iOS bundle ID — APNs uses this as the "topic" for routing pushes.
+const APNS_BUNDLE_ID = 'com.Victorian.FinanceWidget';
+
+// APNs endpoint switches between sandbox (Xcode dev builds) and production
+// (TestFlight + App Store builds). The same .p8 key signs JWTs for both
+// endpoints because it was created with "Sandbox & Production" environment
+// in the Apple Dev portal. APNS_PRODUCTION env var flips us between them —
+// default false for development, set true on Railway when shipping.
+const APNS_HOST = (process.env.APNS_PRODUCTION === 'true')
+  ? 'api.push.apple.com'
+  : 'api.sandbox.push.apple.com';
+
+// In-memory map: Plaid item_id → APNs device token. Populated by
+// /api/register_device on every iOS cold launch. Ephemeral by design —
+// Railway containers don't persist disk across deploys, but the app
+// re-registers on every launch so the map rebuilds within seconds. A
+// webhook arriving DURING the few-second redeploy window is lost; Plaid
+// retries webhooks for ~72h so subsequent ones land fine.
+const deviceTokensByItemId = new Map();
+
+// APNs provider JWT. Apple requires this be re-signed at least every 60
+// minutes; we cache for 50 minutes with a 10-minute safety margin. The
+// JWT is ES256-signed with the .p8 EC private key from the Apple Dev
+// portal. Using Node built-ins (crypto + http2) instead of the `apn`
+// library because `apn` carries 19+ CVEs via outdated transitive deps
+// (jsonwebtoken, node-forge — both have signature-bypass advisories).
+let apnsJwtCache = { token: null, mintedAt: 0 };
+function getApnsJwt() {
+  if (!process.env.APNS_KEY_ID || !process.env.APNS_TEAM_ID || !process.env.APNS_PRIVATE_KEY) {
+    return null;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (apnsJwtCache.token && (now - apnsJwtCache.mintedAt) < 50 * 60) {
+    return apnsJwtCache.token;
+  }
+  const header = Buffer.from(JSON.stringify({ alg: 'ES256', kid: process.env.APNS_KEY_ID })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ iss: process.env.APNS_TEAM_ID, iat: now })).toString('base64url');
+  const message = header + '.' + payload;
+  // dsaEncoding 'ieee-p1363' gives the raw r||s 64-byte signature JWT
+  // expects (default DER format is not accepted by APNs).
+  const signature = crypto
+    .createSign('SHA256')
+    .update(message)
+    .sign({ key: process.env.APNS_PRIVATE_KEY, dsaEncoding: 'ieee-p1363' })
+    .toString('base64url');
+  apnsJwtCache = { token: message + '.' + signature, mintedAt: now };
+  return apnsJwtCache.token;
+}
+
+function sendSilentPush(deviceToken) {
+  const jwt = getApnsJwt();
+  if (!jwt) {
+    console.warn('[APNs] Not configured — skipping push');
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const client = http2.connect('https://' + APNS_HOST);
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      try { client.close(); } catch (e) {}
+      resolve();
+    };
+    client.on('error', (err) => {
+      console.error('[APNs] connect error:', err.message);
+      done();
+    });
+    const req = client.request({
+      ':method': 'POST',
+      ':path': '/3/device/' + deviceToken,
+      'authorization': 'bearer ' + jwt,
+      'apns-topic': APNS_BUNDLE_ID,
+      'apns-push-type': 'background',
+      'apns-priority': '5',
+      'apns-expiration': '0',
+      'content-type': 'application/json',
+    });
+    let status = 0;
+    let body = '';
+    req.on('response', (headers) => { status = headers[':status']; });
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      if (status === 200) {
+        console.log('[APNs] Push sent to', deviceToken.slice(0, 8) + '…');
+      } else {
+        console.warn('[APNs] Push failed (' + status + '):', body);
+      }
+      done();
+    });
+    req.on('error', (err) => {
+      console.error('[APNs] send error:', err.message);
+      done();
+    });
+    req.write(JSON.stringify({ aps: { 'content-available': 1 }, type: 'sync' }));
+    req.end();
+  });
+}
 
 // Apple App Site Association — served at /.well-known/apple-app-site-association
 // for Universal Links. Plaid OAuth bounces the user to PLAID_REDIRECT_URI after the
@@ -85,6 +192,10 @@ app.post('/api/create_link_token', async (req, res) => {
     if (process.env.PLAID_REDIRECT_URI && env !== 'sandbox') {
       linkParams.redirect_uri = process.env.PLAID_REDIRECT_URI;
     }
+    // Stamp the webhook URL onto every new Item. Plaid pings this URL on
+    // SYNC_UPDATES_AVAILABLE / HOLDINGS DEFAULT_UPDATE so the backend can
+    // forward a silent push and the app/widget refresh within minutes.
+    linkParams.webhook = WEBHOOK_URL;
     const response = await plaidClient.linkTokenCreate(linkParams);
     res.json({ link_token: response.data.link_token });
   } catch (err) {
@@ -227,6 +338,88 @@ app.post('/api/get_credit', async (req, res) => {
   } catch (err) {
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Called by iOS app on every cold launch and after every Plaid Link success.
+// Body: { device_token: string, access_tokens: [string] }
+// For each access_token, resolves item_id via /item/get and stores
+// item_id → device_token. Also calls /item/webhook/update to retro-fit the
+// webhook URL onto Items that were created before webhooks were wired —
+// without this, existing Plaid Items would never ping us.
+//
+// One device per item_id, last-write-wins. Idempotent: re-registering the
+// same (item, device) pair is a no-op overwrite.
+app.post('/api/register_device', async (req, res) => {
+  try {
+    const { device_token, access_tokens } = req.body;
+    if (!device_token || !Array.isArray(access_tokens)) {
+      return res.status(400).json({ error: 'device_token and access_tokens[] required' });
+    }
+    const results = [];
+    for (const access_token of access_tokens) {
+      try {
+        const itemRes = await plaidClient.itemGet({ access_token });
+        const itemId = itemRes.data.item.item_id;
+        deviceTokensByItemId.set(itemId, device_token);
+        // Retro-fit webhook URL on Items created before webhook support.
+        // Idempotent — Plaid no-ops if URL is already the same.
+        try {
+          await plaidClient.itemWebhookUpdate({ access_token, webhook: WEBHOOK_URL });
+        } catch (whErr) {
+          console.warn('[Register] webhook update failed for', itemId, ':', whErr.response?.data?.error_code || whErr.message);
+        }
+        results.push({ item_id: itemId, registered: true });
+      } catch (err) {
+        const code = err.response?.data?.error_code;
+        results.push({ access_token_prefix: access_token.slice(0, 12), error: code || err.message });
+      }
+    }
+    console.log('[Register] device', device_token.slice(0, 8) + '… mapped to', results.filter(r => r.registered).length, 'items');
+    res.json({ registered: results });
+  } catch (err) {
+    console.error(err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Plaid webhook receiver. Plaid pings this for transaction / holdings updates
+// on any Item that was created with our WEBHOOK_URL. We just dispatch a silent
+// APNs push to the device mapped to that item_id — the iOS app handles the
+// re-sync via its normal authenticated /api/sync_account or /api/sync_investments
+// path. So the webhook body itself never carries financial data.
+//
+// Signature verification is SKIPPED for V1 (logged as a follow-up). The worst
+// an unverified-but-malicious caller can do is trigger a silent push, which
+// iOS throttles and which produces no data leak (the app re-syncs through its
+// own access_tokens, not through anything in the webhook body).
+app.post('/api/plaid_webhook', async (req, res) => {
+  // Ack within 10s or Plaid retries — push the dispatch into a background task.
+  res.json({ acknowledged: true });
+  try {
+    const { webhook_type, webhook_code, item_id } = req.body || {};
+    console.log('[Webhook]', webhook_type, webhook_code, 'item:', item_id);
+    if (!item_id) return;
+    const deviceToken = deviceTokensByItemId.get(item_id);
+    if (!deviceToken) {
+      console.warn('[Webhook] No device token for item_id', item_id, '— app may not have registered yet');
+      return;
+    }
+    // Only push on codes that mean "fresh data is available." Plaid sends
+    // other admin codes (ERROR, WEBHOOK_UPDATE_ACKNOWLEDGED, etc.) we don't
+    // care to wake the app for. Whitelist these:
+    const wakeCodes = new Set([
+      'SYNC_UPDATES_AVAILABLE',   // TRANSACTIONS — primary signal
+      'DEFAULT_UPDATE',           // TRANSACTIONS or HOLDINGS
+      'INITIAL_UPDATE',           // first historical pull complete
+      'HISTORICAL_UPDATE',        // backfill done
+      'TRANSACTIONS_REMOVED',     // pending → posted state change
+    ]);
+    if (wakeCodes.has(webhook_code)) {
+      await sendSilentPush(deviceToken);
+    }
+  } catch (err) {
+    console.error('[Webhook] processing error:', err.message);
   }
 });
 
