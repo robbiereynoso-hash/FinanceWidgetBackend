@@ -156,6 +156,31 @@ const plaidConfig = new Configuration({
 
 const plaidClient = new PlaidApi(plaidConfig);
 
+// Plaid error codes that mean "this Item is dead — re-Link required to recover."
+// We surface these to iOS as `{ requiresRelink: true }` with a 200 so the app can
+// distinguish "the bank Item needs to be reconnected" from a generic network/500
+// failure. Without this, iOS sees a 500, swallows the error, and keeps showing
+// stale data forever (the exact bug we saw on 2026-05-26).
+//   ITEM_NOT_FOUND       — Item was removed via /item/remove or by user from bank app
+//   INVALID_ACCESS_TOKEN — token was rotated or never valid
+//   ITEM_LOGIN_REQUIRED  — bank password changed; user must re-authenticate
+//   ITEM_NO_VERIFICATION — bank revoked Plaid's auth post-link
+const RELINK_ERROR_CODES = new Set([
+  'ITEM_NOT_FOUND',
+  'INVALID_ACCESS_TOKEN',
+  'ITEM_LOGIN_REQUIRED',
+  'ITEM_NO_VERIFICATION',
+]);
+
+function isRelinkError(err) {
+  const code = err && err.response && err.response.data && err.response.data.error_code;
+  return code && RELINK_ERROR_CODES.has(code);
+}
+
+function relinkErrorCode(err) {
+  return err.response.data.error_code;
+}
+
 // `flow` is "bank" (default) or "investments". Two flows because most banks don't
 // support investments and most brokerages don't support transactions, so a single
 // link_token covering both wouldn't surface either.
@@ -260,6 +285,10 @@ app.post('/api/sync_account', async (req, res) => {
 
     res.json({ balance, accounts, transactions, next_cursor: nextCursor });
   } catch (err) {
+    if (isRelinkError(err)) {
+      console.warn('[sync_account] relink required:', relinkErrorCode(err));
+      return res.json({ requiresRelink: true, errorCode: relinkErrorCode(err) });
+    }
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
@@ -321,6 +350,10 @@ app.post('/api/sync_investments', async (req, res) => {
     const totalValue = accounts.reduce((sum, a) => sum + (a.value || 0), 0);
     res.json({ totalValue, accounts });
   } catch (err) {
+    if (isRelinkError(err)) {
+      console.warn('[sync_investments] relink required:', relinkErrorCode(err));
+      return res.json({ requiresRelink: true, errorCode: relinkErrorCode(err) });
+    }
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
