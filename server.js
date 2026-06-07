@@ -251,7 +251,10 @@ app.post('/api/exchange_token', async (req, res) => {
   try {
     const { public_token } = req.body;
     const response = await plaidClient.itemPublicTokenExchange({ public_token });
-    res.json({ access_token: response.data.access_token });
+    res.json({
+      access_token: response.data.access_token,
+      item_id: response.data.item_id,
+    });
   } catch (err) {
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: err.message });
@@ -267,9 +270,16 @@ app.post('/api/exchange_token', async (req, res) => {
 // falls back to its initials avatar.
 app.post('/api/institution_logo', async (req, res) => {
   try {
-    const { institution_id } = req.body;
+    let { institution_id, access_token } = req.body;
+    // Prefer deriving institution_id from the Item via the access_token, which is
+    // always available. Plaid Link's client metadata omits institution_id on many
+    // OAuth flows (e.g. Robinhood), so relying on a client-supplied id is fragile.
+    if (!institution_id && access_token) {
+      const itemRes = await plaidClient.itemGet({ access_token });
+      institution_id = itemRes.data.item.institution_id;
+    }
     if (!institution_id) {
-      return res.status(400).json({ error: 'institution_id required' });
+      return res.status(400).json({ error: 'institution_id or access_token required' });
     }
     const response = await plaidClient.institutionsGetById({
       institution_id,
