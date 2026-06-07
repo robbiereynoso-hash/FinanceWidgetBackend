@@ -258,6 +258,35 @@ app.post('/api/exchange_token', async (req, res) => {
   }
 });
 
+// Fetch an institution's optional metadata (logo + brand color) by id. Plaid
+// Link's client-side success metadata only carries institution id + name, so
+// the app calls this once per connection to enrich the stored credential.
+// /institutions/get_by_id is NOT billed. `logo` is a base64-encoded PNG string
+// (or null); `primary_color` is a hex string (or null). We return nulls rather
+// than erroring when an institution has no optional metadata, so the app cleanly
+// falls back to its initials avatar.
+app.post('/api/institution_logo', async (req, res) => {
+  try {
+    const { institution_id } = req.body;
+    if (!institution_id) {
+      return res.status(400).json({ error: 'institution_id required' });
+    }
+    const response = await plaidClient.institutionsGetById({
+      institution_id,
+      country_codes: ['US'],
+      options: { include_optional_metadata: true },
+    });
+    const inst = response.data.institution;
+    res.json({
+      logo: inst.logo || null,
+      primary_color: inst.primary_color || null,
+    });
+  } catch (err) {
+    console.error(err.response?.data || err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Bank flow — paginated /transactions/sync, returns balance + accounts + recent transactions.
 app.post('/api/sync_account', async (req, res) => {
   try {
