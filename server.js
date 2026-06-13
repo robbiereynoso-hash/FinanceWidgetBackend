@@ -192,6 +192,13 @@ app.post('/api/create_link_token', async (req, res) => {
   try {
     const flow = (req.body && req.body.flow) || 'bank';
     const products = flow === 'investments' ? ['investments'] : ['transactions'];
+    // Per-install Plaid identity. The iOS app sends a stable per-install UUID so
+    // each install is a DISTINCT Plaid user. A shared client_user_id made Plaid
+    // treat every Link as the same returning user and funnel people back to their
+    // first-linked institution instead of the bank they picked (Bug #12), and was
+    // a privacy bug (all users sharing one Plaid identity). Legacy fallback kept
+    // for any old client that doesn't send the field.
+    const clientUserId = (req.body && req.body.client_user_id) || 'finance-widget-user';
     // OAuth redirect URI — required for production OAuth banks (Chase, BoA, Wells, etc.).
     // Gated on BOTH PLAID_REDIRECT_URI being set AND PLAID_ENV being non-sandbox.
     // Sandbox doesn't validate redirect URIs the same way and rejects link_token_create
@@ -201,7 +208,7 @@ app.post('/api/create_link_token', async (req, res) => {
     // OAuth-less, which is fine — sandbox's First Platypus Bank doesn't OAuth-redirect.
     const env = process.env.PLAID_ENV || 'sandbox';
     const linkParams = {
-      user: { client_user_id: 'finance-widget-user' },
+      user: { client_user_id: clientUserId },
       client_name: 'Finance Widget',
       products,
       country_codes: ['US'],
