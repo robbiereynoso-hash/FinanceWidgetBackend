@@ -313,6 +313,13 @@ app.post('/api/sync_account', async (req, res) => {
     let hasMore = true;
     let accounts = [];
 
+    // [DIAG] Tag a short token suffix so we can follow one Item across log lines
+    // without ever printing the secret. Remove this diagnostic block once the
+    // instant-refresh path is confirmed working.
+    const tok = typeof access_token === 'string' ? access_token.slice(-6) : 'none';
+    const wantsForce = force_refresh === true || force_refresh === 'true';
+    console.log(`[sync_account][${tok}] hit — force_refresh=${JSON.stringify(force_refresh)} (parsed wantsForce=${wantsForce})`);
+
     // Optional forced refresh ($0.12/call): ask Plaid to re-pull from the bank
     // NOW so the sync below returns up-to-the-minute balances instead of Plaid's
     // last cached pull (which can be hours stale). The iOS client only sends this
@@ -321,13 +328,17 @@ app.post('/api/sync_account', async (req, res) => {
     // class failure surfaces like any other (rethrow → outer handler returns
     // requiresRelink); a transient refresh failure must NOT block the sync — we
     // fall through and return cached data.
-    if (force_refresh === true || force_refresh === 'true') {
+    if (wantsForce) {
+      const t0 = Date.now();
       try {
-        await plaidClient.transactionsRefresh({ access_token });
+        const rr = await plaidClient.transactionsRefresh({ access_token });
+        console.log(`[sync_account][${tok}] /transactions/refresh OK in ${Date.now() - t0}ms (request_id=${rr.data?.request_id})`);
       } catch (refreshErr) {
+        const code = refreshErr.response?.data?.error_code || refreshErr.message;
+        console.warn(`[sync_account][${tok}] /transactions/refresh FAILED in ${Date.now() - t0}ms: ${code}`,
+          refreshErr.response?.data || '');
         if (isRelinkError(refreshErr)) throw refreshErr;
-        console.warn('[sync_account] forced refresh failed (continuing with sync):',
-          refreshErr.response?.data?.error_code || refreshErr.message);
+        // else: continue to a normal cached sync below.
       }
     }
 
@@ -346,6 +357,15 @@ app.post('/api/sync_account', async (req, res) => {
 
     added.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
     const transactions = added.slice(0, 100);
+
+    // [DIAG] Show what Plaid actually returned so we can tell whether the balance
+    // genuinely moved. current vs available matters: an outgoing Zelle usually
+    // drops `available` first while `current` lags until the charge posts.
+    const pendingCount = added.filter(a => a.pending).length;
+    console.log(`[sync_account][${tok}] result — depositoryAccts=${depository.length} ` +
+      `current=${balance} ` +
+      `balances=${JSON.stringify(depository.map(a => ({ mask: a.mask, cur: a.balances.current, avail: a.balances.available })))} ` +
+      `txns=${transactions.length} pending=${pendingCount}`);
 
     res.json({ balance, accounts, transactions, next_cursor: nextCursor });
   } catch (err) {
