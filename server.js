@@ -307,11 +307,29 @@ app.post('/api/institution_logo', async (req, res) => {
 // Bank flow — paginated /transactions/sync, returns balance + accounts + recent transactions.
 app.post('/api/sync_account', async (req, res) => {
   try {
-    const { access_token, cursor } = req.body;
+    const { access_token, cursor, force_refresh } = req.body;
     let nextCursor = cursor || null;
     let added = [];
     let hasMore = true;
     let accounts = [];
+
+    // Optional forced refresh ($0.12/call): ask Plaid to re-pull from the bank
+    // NOW so the sync below returns up-to-the-minute balances instead of Plaid's
+    // last cached pull (which can be hours stale). The iOS client only sends this
+    // when the user has turned on the "Instant Updates" toggle (Billing tab); the
+    // free/default path omits the flag and behaves exactly as before. A relink-
+    // class failure surfaces like any other (rethrow → outer handler returns
+    // requiresRelink); a transient refresh failure must NOT block the sync — we
+    // fall through and return cached data.
+    if (force_refresh === true || force_refresh === 'true') {
+      try {
+        await plaidClient.transactionsRefresh({ access_token });
+      } catch (refreshErr) {
+        if (isRelinkError(refreshErr)) throw refreshErr;
+        console.warn('[sync_account] forced refresh failed (continuing with sync):',
+          refreshErr.response?.data?.error_code || refreshErr.message);
+      }
+    }
 
     while (hasMore) {
       const reqBody = { access_token };
